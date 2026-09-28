@@ -13,8 +13,13 @@ from types import MethodType
 from typing import TYPE_CHECKING
 
 from a2a.client.errors import A2AClientHTTPError
-from a2a.types import AgentCapabilities, AgentCard, AgentSkill
-from aiocache import cached  # type: ignore[import-untyped]
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentSkill,
+)
+from aiocache import cached, caches  # type: ignore[import-untyped]
+from aiocache import SimpleMemoryCache  # type: ignore[import-untyped]
 from aiocache.serializers import PickleSerializer  # type: ignore[import-untyped]
 import httpx
 
@@ -32,12 +37,25 @@ from crewai.events.types.a2a_events import (
     A2AAuthenticationFailedEvent,
     A2AConnectionErrorEvent,
 )
+from crewai.utilities.cache_config import get_aiocache_config
 
 
 if TYPE_CHECKING:
     from crewai.a2a.auth.client_schemes import ClientAuthScheme
     from crewai.agent import Agent
     from crewai.task import Task
+
+
+_cache_configured = False
+
+
+def _ensure_cache_configured() -> None:
+    """Configure aiocache on first use (lazy initialization)."""
+    global _cache_configured
+    if _cache_configured:
+        return
+    caches.set_config(get_aiocache_config())
+    _cache_configured = True
 
 
 def _get_tls_verify(auth: ClientAuthScheme | None) -> ssl.SSLContext | bool | str:
@@ -191,6 +209,7 @@ async def afetch_agent_card(
         else:
             auth_hash = _auth_store.compute_key("none", "")
         _auth_store.set(auth_hash, auth)
+        _ensure_cache_configured()
         agent_card: AgentCard = await _afetch_agent_card_cached(
             endpoint, auth_hash, timeout
         )
@@ -223,7 +242,15 @@ def _fetch_agent_card_cached(
     return asyncio.run(coro)
 
 
-@cached(ttl=300, serializer=PickleSerializer())  # type: ignore[untyped-decorator]
+# Pinned to an in-process SimpleMemoryCache: PickleSerializer must never
+# deserialize values from an operator-/attacker-controlled Redis/Valkey
+# backend (that would be a pickle code-execution surface on cache read).
+# The network cache alias configured from VALKEY_URL/REDIS_URL is not used here.
+@cached(
+    ttl=300,
+    cache=SimpleMemoryCache,
+    serializer=PickleSerializer(),
+)  # type: ignore[untyped-decorator]
 async def _afetch_agent_card_cached(
     endpoint: str,
     auth_hash: str,
